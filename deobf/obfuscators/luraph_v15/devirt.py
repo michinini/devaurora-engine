@@ -542,31 +542,53 @@ class VMModel:
         return cap.get(self.maker["args"][0]["name"])
 
 
-def find_ctor_funcs(root):
-    """Functions in the top-level `setmetatable({...})` table constructor: key -> AstExprFunction."""
-    best = None
-    for n in iter_nodes(root):
-        if n.get("type") == "AstExprTable":
-            fns = sum(1 for it in n["items"] if it["value"]["type"] == "AstExprFunction")
-            if best is None or fns > best[0]:
-                best = (fns, n)
-    out = {}
-    if best:
+_CTOR_TABLE = {}     # id(root) -> the constructor table (the VM object's source)
+
+
+def _ctor_table(root):
+    """The table constructor with the most function items: the VM object is
+    built from it (setmetatable({...}))."""
+    if id(root) not in _CTOR_TABLE:
+        best = None
+        for n in iter_nodes(root):
+            if n.get("type") == "AstExprTable":
+                fns = sum(1 for it in n["items"] if it["value"]["type"] == "AstExprFunction")
+                if best is None or fns > best[0]:
+                    best = (fns, n)
+        _CTOR_TABLE[id(root)] = best[1] if best else None
+    return _CTOR_TABLE[id(root)]
+
+
+def _ctor_items(table):
+    """(key, value node) for every item of a constructor table."""
+    out = []
+    if table:
         pos = 0
-        for it in best[1]["items"]:
+        for it in table["items"]:
             if it["kind"] == "item":
                 pos += 1        # positional items: t[1], t[2], ...
-            if it["value"]["type"] != "AstExprFunction":
-                continue
             if it["kind"] == "item":
-                out[pos] = it["value"]
+                out.append((pos, it["value"]))
             elif it["kind"] == "record":
-                out[it["key"]["value"].encode("latin-1")] = it["value"]
+                out.append((it["key"]["value"].encode("latin-1"), it["value"]))
             elif it["kind"] == "general" and it["key"]["type"] == "AstExprConstantNumber":
-                out[S.fix_int(it["key"]["value"])] = it["value"]
+                out.append((S.fix_int(it["key"]["value"]), it["value"]))
             elif it["kind"] == "general" and it["key"]["type"] == "AstExprConstantString":
-                out[it["key"]["value"].encode("latin-1")] = it["value"]
+                out.append((it["key"]["value"].encode("latin-1"), it["value"]))
     return out
+
+
+def find_ctor_funcs(root):
+    """Functions in the top-level `setmetatable({...})` table constructor: key -> AstExprFunction."""
+    return {k: v for k, v in _ctor_items(_ctor_table(root)) if v["type"] == "AstExprFunction"}
+
+
+def ctor_value_map(root):
+    """Every entry of the VM object's constructor table (find_ctor_funcs'
+    table), the non-function values included: with Hardcode Globals Luraph
+    puts the library references there (`[65] = bit32.band`), and a plain
+    closure reads them through its VM-object parameter. -> {key: value node}"""
+    return dict(_ctor_items(_ctor_table(root)))
 
 
 # --------------------------------------------------------------------------
@@ -659,7 +681,8 @@ class State:
 WALK_MAX_ERRORS = 100    # request walks only (see Program._walk)
 WALK_RESTARTS = 64       # walks per function (each new jump register / carried local restarts it;
                          # a stack VM finds its return-address slots one at a time)
-MAX_STACK_DEPTHS = 8     # stack VM: distinct stack depths per pc (see Program._walk)
+MAX_STACK_DEPTHS = 32    # stack VM: distinct stack depths per pc (see Program._walk);
+                         # RPC-heavy scripts merge more depths at loop heads (fn5-style arg accumulation)
 STACK_WALK_MAX = 30000   # stack VM: states per function before giving up on the carried stack pointer
 
 
@@ -1028,6 +1051,11 @@ class ProtoLifter:
             text = lines[l1][c1:c2]
         else:
             text = "\n".join([lines[l1][c1:]] + lines[l1 + 1:l2] + [lines[l2][:c2]])
+        raw = text.encode("latin-1")     # the source's bytes: valid UTF-8 stays, the rest replaces
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", "replace")
         return text if len(text) <= 2000 else None
 
     def sym_binop(self, op, a, b):
@@ -1498,8 +1526,27 @@ class ProtoLifter:
             target = getattr(self.vm, "siblings", {}).get(id(node)) if node is not None else None
             if target is not None:
                 return self.make_closure(args, target)
+            pm = plain_maker(node) if node is not None else None
+            if pm is not None:
+                return self.make_plain_closure(args, pm, node)
             if node is not None:
-                return it.call_lua(LuaFunc(node, Scope()), args)
+                if os.environ.get("DEVIRT_PLAIN_DBG"):
+                    print("[plain-fallback] UNRECOGNIZED maker at %s args=%d" % (
+                        node.get("location"), len(args.items)), file=sys.stderr)
+                r = it.call_lua(LuaFunc(node, Scope()), args)
+                f = r.first() if isinstance(r, Multi) else r
+                if isinstance(f, LuaFunc):
+                    # an unrecognized plain maker (its inner function reads the
+                    # VM object or proto): keep the closure as a value so the
+                    # walk goes on; it renders as a stub when its text cannot
+                    # be lifted (plain_closure_lines raises)
+                    if os.environ.get("DEVIRT_PLAIN_DBG"):
+                        print("[plain-fallback]   -> inner at %s (reads maker params?)" % (
+                            f.node.get("location"),), file=sys.stderr)
+                    c = ClosureExpr(PlainProto(f.node, node, None), [])
+                    self.children.append(c)
+                    return c
+                return r
             if fn.pf_tid is None:
                 raise Unsupported("call of unknown VM function lf%d" % fn.lfid)
             # a VM closure kept in the VM object: an ordinary call (as_expr)
@@ -1542,6 +1589,52 @@ class ProtoLifter:
                 entries.append(ups.get(i))
         c = ClosureExpr(proto, entries)
         c.vm = vm
+        for e in entries:
+            if isinstance(e, MaybeBox):
+                self.captured_regs.add(e.reg)
+            if isinstance(e, LTable):
+                for v in e.h.values():
+                    if isinstance(v, int) and any(isinstance(x, RegFile) for x in e.h.values()):
+                        self.captured_regs.add(v)
+        self.children.append(c)
+        return c
+
+    def make_plain_closure(self, args, pm, node):
+        """A closure of a plain-Lua maker (plain_maker): lifted from the
+        inner function's text with its upvalue reads rewritten (see
+        plain_closure_lines), like a VM closure."""
+        inner, upi, wraplocs = pm
+        vproto = args.items[3] if len(args.items) > 3 else None
+        if not isinstance(vproto, LTable):
+            vproto = None
+        if vproto is not None:
+            # the wrap the closure-maker calls and constant reads need: ask
+            # for its missing entries now (decoded in the next constant round)
+            k8 = vproto.get(8)
+            wrap = vproto.get(k8) if isinstance(k8, int) else None
+            if isinstance(wrap, LTable) and wrap.tid in self.dump.lazy:
+                path = self.dump.paths().get(wrap.tid)
+                if path is not None:
+                    uploc = node["args"][upi]["location"] if upi is not None else None
+                    ks, calls = plain_closure_deps(inner, node, wraplocs, uploc)
+                    for a, b, _ in calls:
+                        ks.add(a)
+                        ks.add(b)
+                    for k in sorted(ks):
+                        if wrap.get(k) is None:
+                            self.requests.add(",".join(str(x) for x in path + [k]))
+        entries = []
+        if upi is not None:
+            ups = args.items[upi] if len(args.items) > upi else None
+            if isinstance(ups, LTable):
+                for i in range(1, ups.length() + 1):
+                    entries.append(ups.get(i))
+            elif ups not in (None, False):
+                raise Unsupported("plain closure of upvalue list %r" % (ups,))
+        c = ClosureExpr(PlainProto(inner, node,
+                                   node["args"][upi]["location"] if upi is not None else None,
+                                   vproto, wraplocs),
+                        entries)
         for e in entries:
             if isinstance(e, MaybeBox):
                 self.captured_regs.add(e.reg)
@@ -1974,9 +2067,12 @@ class Stepper:
         self.sp_cands = self._stack_pointer_candidates()
 
     def _stack_pointer_candidates(self):
-        """Prologue locals the handlers use directly as a register index
-        (`R[M]`): only these can be a stack pointer. (A register VM's
-        multret top is carried too, but the lifter models it otherwise.)"""
+        """Locals the handlers use directly as a register index (`R[M]`):
+        only these can be a stack pointer. (A register VM's multret top is
+        carried too, but the lifter models it otherwise.) Resolved through the
+        scope chain: Luraph can hoist the stack and its pointer out of the
+        dispatch function into the VM closure's body (before the tcall), so
+        `inner.vars` alone misses them."""
         # (per VM: every function of the VM runs the same loop function)
         cache = self.vm.__dict__.setdefault("_sp_cands", {})
         if None not in cache:
@@ -1990,8 +2086,12 @@ class Stepper:
             cache[None] = pairs
         _, inner = self._fresh_scopes(None, S.Interp(self.lf))
         self.lf.out = []
-        regfiles = {k for k, v in inner.vars.items() if isinstance(v, RegFile)}
-        return {i for r, i in cache[None] if r in regfiles} & set(inner.vars)
+
+        def val_at(k):
+            sc = inner.lookup(k)
+            return sc.vars.get(k) if sc is not None else None
+        return {i for r, i in cache[None] if isinstance(val_at(r), RegFile)
+                and val_at(i) is not None}
 
     def _local_value(self, loc, before):
         """The expression a local of the loop function is declared with."""
@@ -2017,10 +2117,12 @@ class Stepper:
         return State(mode, pc, ks.vars[self.vm.kstack_key] if ks else None, locs=locs)
 
     def _carried(self, inner):
-        """State.locs: the carried locals' current values."""
+        """State.locs: the carried locals' current values (through the scope
+        chain: they can live in an enclosing function of the loop)."""
         out = []
         for k in sorted(self.carry):
-            v = inner.vars.get(k)
+            sc = inner.lookup(k)
+            v = sc.vars.get(k) if sc is not None else None
             if not (isinstance(v, int) and not isinstance(v, bool)):
                 raise Unsupported("symbolic value of a VM local carried between instructions (%r)" % (v,))
             out.append((k, v))
@@ -2044,7 +2146,11 @@ class Stepper:
             if self.vm.kstack_key:
                 inner.lookup(self.vm.kstack_key).vars[self.vm.kstack_key] = state.kstack
             for k, v in state.locs:
-                inner.vars[k] = v
+                sc = inner.lookup(k)
+                if sc is not None:
+                    sc.vars[k] = v
+                else:
+                    inner.vars[k] = v
         return cs, inner
 
     def run_once(self, state, decisions, tprefix):
@@ -2066,6 +2172,12 @@ class Stepper:
         it.decisions = list(decisions)
         cs, inner = self._fresh_scopes(state, it)
         inner.vars = acc = _AccessLog(inner.vars)
+        if not isinstance(cs.vars, _AccessLog):
+            # carried locals can live in an enclosing function of the loop
+            # (the VM closure's body, before the tcall): log that scope too
+            cs.vars = pacc = _AccessLog(cs.vars)
+        else:
+            pacc = cs.vars
         loop_i = None
         for i, st, w in self.loops:
             if st is None or S.truthy(it.eval(self.conds[i], inner)):
@@ -2104,7 +2216,7 @@ class Stepper:
         if outcome[0] == "ret":
             m = outcome[1] if isinstance(outcome[1], Multi) else Multi([outcome[1]])
             outcome = ("ret", Multi([lf.value_of(x) if not isinstance(x, SymList) else x for x in m.items], m.tail))
-        self._note_access(acc)
+        self._note_access(acc, pacc)
         if outcome[0] == "next":
             def get(k):
                 return inner.lookup(k).vars[k]
@@ -2123,15 +2235,21 @@ class Stepper:
             return it, Next(nxt)
         return it, Ret(outcome[1])
 
-    def _note_access(self, acc):
-        """Collect which prologue locals handlers read first / write; a new
-        carried local (see __init__) sets `new_carry`."""
+    def _note_access(self, acc, pacc=None):
+        """Collect which loop-function locals handlers read first / write; a new
+        carried local (see __init__) sets `new_carry`. `pacc` logs the enclosing
+        VM-closure scope (Luraph can hoist the stack and its pointer there)."""
         if getattr(self, "no_carry", False):
             return
         self.read_first |= acc.read_first
         self.written |= acc.written
+        if pacc is not None:
+            self.read_first |= pacc.read_first
+            self.written |= pacc.written
         for k in (self.read_first & self.written & self.sp_cands) - self.carry - self.not_carried - self.fixed_decls:
             v = dict.get(acc, k)
+            if v is None and pacc is not None:
+                v = dict.get(pacc, k)
             if k in self.lf.special or not (isinstance(v, int) and not isinstance(v, bool)):
                 self.not_carried.add(k)
                 continue
@@ -2322,6 +2440,401 @@ def _jit_nested_model(node):
         except (Unsupported, StopIteration, KeyError):
             _JIT_NESTED[id(node)] = (node, None)
     return _JIT_NESTED[id(node)][1]
+
+
+_PLAIN_MAKER = {}       # maker node id -> (inner function, upvalue-list param index, wrap-local locations)
+
+
+def _is_wrap_bind(st, ploc):
+    """`local N = V[V[8]]` - a local of the maker bound to its proto's spec
+    table (the wrap: child protos, upvalue pairs, lazily decrypted constants)."""
+    if st.get("type") != "AstStatLocal" or len(st["vars"]) != 1 or len(st["values"]) != 1:
+        return None
+    v = st["values"][0]
+    if v.get("type") != "AstExprIndexExpr" or v["expr"].get("type") != "AstExprLocal" \
+            or v["expr"]["local"]["location"] != ploc:
+        return None
+    idx = v["index"]        # V[8]
+    if idx.get("type") != "AstExprIndexExpr" or idx["expr"].get("type") != "AstExprLocal" \
+            or idx["expr"]["local"]["location"] != ploc \
+            or idx["index"].get("type") != "AstExprConstantNumber" \
+            or S.fix_int(idx["index"]["value"]) != 8:
+        return None
+    return st["vars"][0]["location"]
+
+
+def plain_maker(node):
+    """(inner function, upvalue-list parameter index) of a plain-Lua closure
+    maker, or None. Luraph can compile a script function to plain Lua: its
+    maker's whole body is `return function(...) ... end` and the inner
+    function reads its upvalues through the upvalue-list parameter (`r[i]` by
+    value, `r[i][k1][r[i][k2]]` through a box). The closure-op call is
+    (vmobj, nil, upvals, proto, ...), so the upvalue list is parameter 2 (the
+    last of repeated names: `function(r,r,r)`, `function(r,X,X,V,N,N)`), like
+    the VM maker's parameter layout. Makers whose inner function also reads
+    the VM-object or proto parameters (it creates nested VM closures through
+    VM-object helpers) are accepted too: the rewrite then fails and the
+    closure renders as an error stub, but the walk goes on.
+    VM makers do much more around the closure, so a single bare return tells
+    them apart."""
+    if id(node) not in _PLAIN_MAKER:
+        pm = None
+        if isinstance(node, dict) and node.get("type") == "AstExprFunction":
+            args = node["args"]
+            body = node["body"]["body"]
+            wraplocs = set()
+            if body and body[-1]["type"] == "AstStatReturn" and len(body[-1]["list"]) == 1 \
+                    and body[-1]["list"][0]["type"] == "AstExprFunction":
+                ok = len(args) > 3 or not body[:-1]
+                for st in body[:-1]:
+                    wl = _is_wrap_bind(st, args[3]["location"]) if len(args) > 3 else None
+                    if wl is None:
+                        ok = False
+                        break
+                    wraplocs.add(wl)
+                if ok:
+                    inner = body[-1]["list"][0]
+                    if len(args) >= 3:
+                        upi = 2      # (vmobj, nil, upvals, proto, ...): the closure-op convention
+                    elif args:
+                        read = set()
+                        for n in iter_nodes(inner):
+                            if n.get("type") == "AstExprLocal":
+                                read.add(n["local"]["location"])
+                        upi = len(args) - 1 if args[-1]["location"] in read else None
+                    else:
+                        upi = None
+                    pm = (inner, upi, wraplocs)
+        _PLAIN_MAKER[id(node)] = pm
+    return _PLAIN_MAKER[id(node)]
+
+
+class PlainProto(LTable):
+    """The "proto" of a plain-Lua closure: the function node, its maker, the
+    upvalue-list parameter's declaration (None when self-contained), the
+    runtime proto table the closure-op passed (the wrap's source; None on the
+    fallback path) and the maker's wrap-local declarations."""
+    __slots__ = ("fn", "maker", "uploc", "vproto", "wraplocs")
+
+    def __init__(self, fn, maker, uploc, vproto=None, wraplocs=()):
+        LTable.__init__(self)
+        self.fn, self.maker, self.uploc = fn, maker, uploc
+        self.vproto, self.wraplocs = vproto, wraplocs
+
+
+_PLAIN_DEPS = {}       # inner function node id -> (wrap keys read, closure-maker calls)
+
+
+def _const_int(e):
+    if e is not None and e.get("type") == "AstExprConstantNumber":
+        return S.fix_int(e["value"])
+    return None
+
+
+def _cz_call(n, maker, uploc):
+    """A VM-closure maker call on the VM-object parameter: `r:cZ(a, b, src, V,
+    X, ...)` (upvalues built from the source table) or `r:kZ(a, b, V, X, ...)`
+    (upvalues taken from the parent's list). The child proto and its upvalue
+    pairs are wrap[a] and wrap[b]. -> (a, b, source table node or None) or None."""
+    if n.get("type") != "AstExprCall" or n.get("func", {}).get("type") != "AstExprIndexName":
+        return None
+    f = n["func"]
+    if f.get("expr", {}).get("type") != "AstExprLocal" \
+            or f["expr"]["local"]["location"] != maker["args"][0]["location"]:
+        return None
+    args = n.get("args", [])
+    if len(args) < 5 or _const_int(args[0]) is None or _const_int(args[1]) is None:
+        return None
+    p3 = maker["args"][3]["location"] if len(maker["args"]) > 3 else None
+    if args[2].get("type") == "AstExprTable" and p3 is not None \
+            and args[3].get("type") == "AstExprLocal" and args[3]["local"]["location"] == p3 \
+            and uploc is not None and args[4].get("type") == "AstExprLocal" \
+            and args[4]["local"]["location"] == uploc:
+        return (_const_int(args[0]), _const_int(args[1]), args[2])       # cZ
+    if p3 is not None and args[2].get("type") == "AstExprLocal" \
+            and args[2]["local"]["location"] == p3 \
+            and uploc is not None and args[3].get("type") == "AstExprLocal" \
+            and args[3]["local"]["location"] == uploc:
+        return (_const_int(args[0]), _const_int(args[1]), None)          # kZ
+    return None
+
+
+def plain_closure_deps(fn, maker, wraplocs, uploc):
+    """What a plain closure's text needs from the runtime data: the wrap keys
+    it reads (`N[k]`, k constant: a lazily decrypted constant) and its
+    VM-closure maker calls (`r:cZ(a, b, ...)` / `r:kZ(a, b, ...)`: the child
+    protos and upvalue pairs, wrap[a] and wrap[b]).
+    -> ({k}, [(a, b, call node)])"""
+    key = id(fn)
+    if key not in _PLAIN_DEPS:
+        ks, calls = set(), []
+        for n in iter_nodes(fn):
+            if n.get("type") == "AstExprIndexExpr" and n["expr"].get("type") == "AstExprLocal" \
+                    and n["expr"]["local"]["location"] in wraplocs \
+                    and n["index"].get("type") == "AstExprConstantNumber":
+                ks.add(S.fix_int(n["index"]["value"]))
+            elif n.get("type") == "AstExprCall":
+                cz = _cz_call(n, maker, uploc)
+                if cz is not None:
+                    calls.append((cz[0], cz[1], n))
+        _PLAIN_DEPS[key] = (ks, calls)
+    return _PLAIN_DEPS[key]
+
+
+def _box_shape(n, uploc):
+    """`r[i][k1][r[i][k2]]` (a box read: k1 holds the register file, k2 the
+    register index) -> (i, k1, k2), else None."""
+    if n.get("type") != "AstExprIndexExpr":
+        return None
+    obj, key = n["expr"], n["index"]
+    if obj.get("type") != "AstExprIndexExpr" or key.get("type") != "AstExprIndexExpr":
+        return None
+    oobj = obj["expr"]
+    if oobj.get("type") != "AstExprIndexExpr":
+        return None
+    if oobj["expr"].get("type") != "AstExprLocal" or oobj["expr"]["local"]["location"] != uploc:
+        return None
+    if oobj["index"].get("type") != "AstExprConstantNumber" \
+            or obj["index"].get("type") != "AstExprConstantNumber":
+        return None
+    i, k1 = int(oobj["index"]["value"]), int(obj["index"]["value"])
+    kbase = key["expr"]
+    if kbase.get("type") != "AstExprIndexExpr":
+        return None
+    if kbase["expr"].get("type") != "AstExprLocal" or kbase["expr"]["local"]["location"] != uploc:
+        return None
+    if kbase["index"].get("type") != "AstExprConstantNumber" \
+            or key["index"].get("type") != "AstExprConstantNumber":
+        return None
+    if int(kbase["index"]["value"]) != i:
+        return None
+    return (i, k1, int(key["index"]["value"]))
+
+
+def plain_closure_lines(vm, proto, upnames, boxes, xref=None):
+    """The inner function's body text with every upvalue read rewritten to the
+    captured name: `r[i]` (by value) and `r[i][k1][r[i][k2]]` (a box: the
+    parent's register, also for writes). With `xref` (a FunctionLifter) three
+    more rewrites become possible: library references read through the
+    VM-object parameter (`r[65](...)` -> `bit32.band(...)`, Hardcode
+    Globals), the wrap's lazily decrypted constants (`N[37]` -> `"table"`)
+    and the VM-closure maker calls (`r:cZ(a, b, src, V, X, ...)` -> the
+    lifted child function). Raises Unsupported for reads that stay
+    unrewritable (the VM object or proto as a value, a symbolic wrap index)."""
+    fn = proto.fn
+    lines = getattr(vm, "src_lines", None)
+    if not lines:
+        raise Unsupported("no source for a plain closure")
+    mk = proto.maker
+    p0 = mk["args"][0]["location"] if mk.get("args") else None
+    others = {a["location"] for a in mk.get("args", [])} - {proto.uploc} \
+        if proto.uploc is not None else {a["location"] for a in mk.get("args", [])}
+    wraplocs = set(getattr(proto, "wraplocs", ()) or ())
+    body = fn["body"]["body"]
+    if not body:
+        return []
+    bl1, bc1, _, _ = vmmap.loc(body[0])
+    _, _, bl2, bc2 = vmmap.loc(body[-1])
+
+    def off(l, c):
+        if l == bl1:
+            return c - bc1
+        o = len(lines[bl1]) - bc1 + 1
+        for k in range(bl1 + 1, l):
+            o += len(lines[k]) + 1
+        return o + c
+
+    def span(n):
+        l1, c1, l2, c2 = vmmap.loc(n)
+        return off(l1, c1), off(l2, c2)
+
+    def covered(a, b):
+        return any(s <= a and b <= e for s, e, _ in reps)
+
+    reps = []       # (start, end, replacement) over the body text
+    box_keys = set()
+    for n in iter_nodes(fn):
+        m = _box_shape(n, proto.uploc)
+        if m is None:
+            continue
+        i, k1, k2 = m
+        if boxes.get(i) == (k1, k2) and i in upnames:
+            reps.append((span(n)[0], span(n)[1], upnames[i]))
+            box_keys.add(i)
+    # the VM-closure maker calls (`r:cZ(...)` / `r:kZ(...)`): the whole call
+    # becomes the lifted child function (registered first so reads of the
+    # maker's VM-object/proto parameters inside it are covered)
+    if xref is not None:
+        _, calls = plain_closure_deps(fn, mk, wraplocs, proto.uploc)
+        for a, b, n in calls:
+            sa, sb = span(n)
+            reps.append((sa, sb, xref.plain_cz_text(proto, n, upnames, boxes)))
+    for n in iter_nodes(fn):
+        if n.get("type") != "AstExprIndexExpr":
+            continue
+        if n["expr"].get("type") != "AstExprLocal":
+            continue
+        loc = n["expr"]["local"]["location"]
+        if loc == proto.uploc:
+            if n["index"].get("type") != "AstExprConstantNumber":
+                continue       # a symbolic index: caught by the whole-list check
+            i = int(n["index"]["value"])
+            a, b = span(n)
+            if covered(a, b):
+                continue       # part of a box read
+            if i in box_keys:
+                raise Unsupported("plain closure reads a box upvalue as a value (%d)" % i)
+            if i not in upnames:
+                raise Unsupported("plain closure reads upvalue %d (not in its list)" % i)
+            reps.append((a, b, upnames[i]))
+        elif xref is not None and loc == p0 and n["index"].get("type") == "AstExprConstantNumber" \
+                and n["index"].get("value") is not None:
+            # a library reference through the VM-object parameter
+            k = S.fix_int(n["index"]["value"])
+            t = xref.plain_lib_text(k)
+            if t is not None:
+                a, b = span(n)
+                if not covered(a, b):
+                    reps.append((a, b, t))
+        elif xref is not None and loc in wraplocs:
+            # a lazily decrypted constant of the wrap
+            if n["index"].get("type") != "AstExprConstantNumber":
+                continue       # a symbolic index: caught by the wrap check below
+            a, b = span(n)
+            if covered(a, b):
+                continue
+            t = xref.plain_const_text(proto, S.fix_int(n["index"]["value"]))
+            if t is None:
+                raise Unsupported("wrap constant %d is not decoded" % S.fix_int(n["index"]["value"]))
+            reps.append((a, b, t))
+    for n in iter_nodes(fn):
+        if n.get("type") == "AstExprLocal":
+            loc = n["local"]["location"]
+            if loc == proto.uploc:
+                a, b = span(n)
+                if not covered(a, b):
+                    raise Unsupported("plain closure uses its upvalue list as a value")
+            elif loc in wraplocs:
+                a, b = span(n)
+                if not covered(a, b):
+                    raise Unsupported("plain closure uses its spec table as a value")
+            elif loc in others:
+                a, b = span(n)
+                if not covered(a, b):
+                    raise Unsupported("plain closure uses its maker's VM-object/proto parameter")
+    if bl1 == bl2:
+        text = lines[bl1][bc1:bc2]
+    else:
+        text = "\n".join([lines[bl1][bc1:]] + lines[bl1 + 1:bl2] + [lines[bl2][:bc2]])
+    out, pos = [], 0
+    for s, e, r in sorted(reps):
+        if s < pos:
+            raise Unsupported("overlapping upvalue reads")
+        out.append(text[pos:s])
+        # the minified source needs no space after `]`/before a keyword: a
+        # replacement that is itself identifier-like must re-add one
+        if r and (r[0].isalnum() or r[0] == "_") and s > 0 and (text[s - 1].isalnum() or text[s - 1] == "_"):
+            r = " " + r
+        if r and (r[-1].isalnum() or r[-1] == "_") and e < len(text) and (text[e].isalnum() or text[e] == "_"):
+            r = r + " "
+        out.append(r)
+        pos = e
+    out.append(text[pos:])
+    text = "".join(out)
+    raw = text.encode("latin-1")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", "replace")
+    if any(len(l) > 200 for l in text.split("\n")):
+        # Luraph compiles the plain body to one minified line: reformat it
+        # over the engine's lexer (minimal spacing, one statement per line,
+        # long table constructors split at their commas)
+        try:
+            text = _reformat_plain(text)
+        except Exception:      # noqa: BLE001 - keep the raw text on a lexer bug
+            pass
+    return text.split("\n")
+
+
+_PLAIN_BREAK_KW = {"local", "if", "while", "for", "repeat", "return", "break", "continue", "function"}
+_PLAIN_OPENERS = ("then", "do", "repeat")
+
+
+def _reformat_plain(text):
+    """A minified plain-closure body -> readable Luau: one statement per line,
+    indented, tokens spaced only where Lua needs it (strings kept whole;
+    long table constructors split at their commas)."""
+    import lexer
+    toks = [t for t in lexer.tokenize(text) if t[0] != "comment"]
+    out, cur, depth = [], [], 0
+    stack = []       # open brackets
+    fn_paren = []    # stack depths at which a function's parameter list opened
+    want_fn = False  # saw `function`, waiting for its parameter `(`
+    prev, prev_kind = None, None
+
+    def flush():
+        if cur:
+            out.append("  " * depth + "".join(cur))
+            del cur[:]
+
+    for kind, t in toks:
+        # ---- a break before the token ----
+        if kind == "kw" and t in ("end", "until", "elseif"):
+            flush()
+            depth = max(0, depth - 1)
+        elif kind == "kw" and t == "else":
+            flush()
+            depth = max(0, depth - 1)
+        elif kind == "kw" and t in _PLAIN_BREAK_KW and not stack and prev is not None \
+                and (prev_kind in ("name", "num", "str") or prev in (")", "]", "}", ";", "end", "...")):
+            flush()          # a statement starter right after a statement end
+
+        # ---- spacing ----
+        sp = True
+        if not cur or prev is None:
+            sp = False
+        elif prev in ("(", "[", "{", "#", ".", ":") or t in (")", "]", "}", ",", ";", ".", ":"):
+            sp = False
+        elif t == "(" and (prev_kind in ("name", "kw", "str", "num") or prev in (")", "]", "}")):
+            sp = False       # a call
+        elif t == "[" and (prev_kind in ("name", "str", "num") or prev in (")", "]", "}")):
+            sp = False       # an index
+        elif t == '"' or t == "'":
+            sp = prev_kind in ("name", "kw", "num")
+        cur.append((" " if sp else "") + t)
+
+        # ---- structural effects after the token ----
+        if kind == "op" and t in "([{":
+            if want_fn and t == "(":
+                fn_paren.append(len(stack))
+                want_fn = False
+            stack.append(t)
+        elif kind == "op" and t in ")]}":
+            if stack:
+                stack.pop()
+                if t == ")" and fn_paren and fn_paren[-1] == len(stack):
+                    fn_paren.pop()
+                    flush()
+                    depth += 1       # the function's body starts here
+        elif kind == "kw":
+            if t == "function":
+                want_fn = True
+            elif t in _PLAIN_OPENERS:
+                flush()
+                depth += 1
+            elif t == "else":
+                flush()
+                depth += 1
+        elif kind == "op" and t == ";":
+            flush()
+        prev, prev_kind = t, kind
+        # long line inside a table constructor: split after its commas only
+        if kind == "op" and t == "," and stack and stack[-1] == "{" \
+                and sum(len(x) for x in cur) > 96:
+            flush()
+    flush()
+    return "\n".join(out)
 
 
 def _declared_in(node):
@@ -2692,6 +3205,7 @@ class Program:
             if i == 0:
                 self.root = root
                 self.lines = lines
+                self.ctor_vals = ctor_value_map(root)
             for tag, vm in vms.items():
                 self.vms[tag] = vm
                 self.ctors[id(vm)] = ctor
@@ -3043,6 +3557,8 @@ class FunctionLifter:
         proto = c.proto
         if id(proto) in self.lifted:
             return CG.FuncE(["function(...) --[[ recursive proto ]] end"])
+        if isinstance(proto, PlainProto):
+            return self.plain_closure(vm, vmobj, c, parent_names, depth)
         capnames = getattr(c, "capnames", {})
         upnames = {}
         fmap = getattr(c, "frame_map", {})
@@ -3092,6 +3608,265 @@ class FunctionLifter:
         f = CG.FuncE(["function(%s)" % ", ".join(params)] + ["\t" + l for l in lines] + ["end"])
         f.captures = set(upnames.values())
         return f
+
+    def plain_closure(self, vm, vmobj, c, parent_names, depth):
+        """A plain-Lua closure (PlainProto): the inner function's text with
+        the upvalue reads rewritten (plain_closure_lines)."""
+        import codegen as CG
+        proto = c.proto
+        capnames = getattr(c, "capnames", {})
+        upnames = {}
+        boxes = {}     # upvalue index -> (register-file key, register-index key)
+        for i, e in enumerate(c.upvals, 1):
+            if isinstance(e, LTable):
+                rf = [(k, v) for k, v in e.h.items() if isinstance(v, RegFile)]
+                ints = [(k, v) for k, v in e.h.items() if isinstance(v, int) and not isinstance(v, bool)]
+                if len(rf) == 1 and len(ints) == 1:
+                    boxes[i] = (rf[0][0], ints[0][0])
+                    upnames[i] = capnames.get(ints[0][1], "nil")
+                    continue
+                ups = [v for v in e.h.values() if isinstance(v, UpContainer)]
+                if ups:
+                    upnames[i] = parent_names.get(("up", ups[0].idx), "upv%d" % ups[0].idx)
+                    continue
+                upnames[i] = "nil"
+            elif isinstance(e, MaybeBox):
+                # a by-reference capture through the open-upvalue sink: the
+                # runtime box it reads is {[4]=registers, [7]=index}
+                boxes[i] = (4, 7)
+                upnames[i] = capnames.get(e.reg, "nil")
+            elif isinstance(e, Reg):
+                upnames[i] = capnames.get(e.n, "nil")
+            elif isinstance(e, (BoxProxy, Upval)):
+                upnames[i] = parent_names.get(("up", e.idx), "upv%d" % e.idx)
+            elif e is None or isinstance(e, (bool, int, float, bytes)):
+                upnames[i] = ("nil" if e is None else "true" if e is True else "false" if e is False
+                              else S.fmt_num(e) if isinstance(e, (int, float)) else CG.quote(e))
+            else:
+                upnames[i] = "nil"
+        mkey = ("plain", id(proto.fn), depth, tuple(sorted(upnames.items(), key=repr)))
+        memo = self.__dict__.setdefault("_closure_memo", {})
+        if mkey in memo:
+            lines, params = memo[mkey]
+        else:
+            keep_depth, keep_obj = getattr(self, "_plain_depth", None), getattr(self, "_cz_vmobj", None)
+            self._plain_depth, self._cz_vmobj = depth, vmobj
+            try:
+                lines = plain_closure_lines(vm, proto, upnames, boxes, self)
+            except Unsupported as ex:
+                lines = ["error(\"devirt: could not lift closure: %s\")" % str(ex).replace("\"", "'")]
+                if os.environ.get("DEVIRT_PLAIN_DUMP"):
+                    try:
+                        _body = proto.fn["body"]["body"]
+                        _bl1, _bc1, _, _ = vmmap.loc(_body[0])
+                        _, _, _bl2, _bc2 = vmmap.loc(_body[-1])
+                        with open(os.environ["DEVIRT_PLAIN_DUMP"], "a", encoding="utf-8") as _f:
+                            _f.write("=== closure upnames=%s boxes=%s uploc=%s wraplocs=%s ===\n%s\n"
+                                     % (upnames, boxes, proto.uploc, getattr(proto, "wraplocs", None),
+                                        "\n".join(vm.src_lines[_bl1:_bl2 + 1])))
+                    except Exception as _e:  # noqa: BLE001
+                        print("[!] plain dump failed: %s" % _e, file=sys.stderr)
+            finally:
+                if keep_depth is None and keep_obj is None:
+                    self.__dict__.pop("_plain_depth", None)
+                    self.__dict__.pop("_cz_vmobj", None)
+                else:
+                    self._plain_depth, self._cz_vmobj = keep_depth, keep_obj
+            params = [a["name"] for a in proto.fn.get("args", [])] + \
+                (["..."] if proto.fn.get("vararg") else [])
+            memo[mkey] = (lines, params)
+        self.stats["functions"] += 1
+        f = CG.FuncE(["function(%s)" % ", ".join(params)] + ["\t" + l for l in lines] + ["end"])
+        f.captures = set()
+        for nm in upnames.values():
+            if isinstance(nm, str) and nm.isidentifier():
+                f.captures.add(nm)
+            elif isinstance(nm, str) and nm.endswith("]") and "[" in nm:
+                f.captures.add(nm.split("[", 1)[0])     # a live table slot: d[1]
+        return f
+
+    # -- the plain-closure xref: values only the runtime data can give ------
+
+    def plain_wrap(self, proto):
+        """The spec table of a plain closure's proto (vproto[vproto[8]]):
+        child protos, upvalue pairs and lazily decrypted constants."""
+        vp = getattr(proto, "vproto", None)
+        if not isinstance(vp, LTable):
+            return None
+        k8 = vp.get(8)
+        w = vp.get(k8) if isinstance(k8, int) else None
+        return w if isinstance(w, LTable) else None
+
+    def plain_lib_text(self, k):
+        """`r[65]` -> `bit32.band`: the library reference the VM object's
+        constructor table holds at k (Hardcode Globals), or None (a VM
+        function or nothing: not rewritable)."""
+        vals = getattr(self.prog, "ctor_vals", None)
+        if not vals:
+            return None
+        v = vals.get(k)
+        if not isinstance(v, dict) or v.get("type") not in ("AstExprLocal", "AstExprIndexName"):
+            return None
+        lines = getattr(self.prog, "lines", None)
+        if not lines:
+            return None
+        l1, c1, l2, c2 = vmmap.loc(v)
+        if l1 != l2:
+            return None
+        return lines[l1][c1:c2]
+
+    def plain_const_text(self, proto, k):
+        """`N[k]` -> the constant's literal text (a lazily decrypted wrap
+        entry), or None when it is not decoded (a request was registered)."""
+        w = self.plain_wrap(proto)
+        if w is None:
+            return None
+        v = w.get(k)
+        if v is None and w.tid in self.prog.dump.lazy:
+            path = self.prog.dump.paths().get(w.tid)
+            if path is not None:
+                rq = ",".join(str(x) for x in path + [k])
+                v = self.prog.dump.overrides.get(rq)
+                if v is None:
+                    v = self.prog.dump.fetch(rq)
+                    if v is None and rq not in self.prog.requests:
+                        self.prog.requests.add(rq)      # the next round decodes it
+                        return None
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return S.fmt_num(v)
+        if isinstance(v, (bytes, bytearray)):
+            import codegen as CG
+            return CG.quote(bytes(v))
+        return None
+
+    def plain_cz_text(self, proto, call, parent_upnames, parent_boxes):
+        """The lifted child function a VM-closure maker call makes
+        (`r:cZ(a, b, src, V, X, ...)`: wrap[a] is the child proto, wrap[b]
+        its upvalue pairs; `r:kZ(a, b, V, X, ...)` takes the upvalues from
+        the parent's list). The child's upvalue names come from the call's
+        source table (live table slots for the boxes) and the parent's
+        upvalue names."""
+        import codegen as CG
+        cz = _cz_call(call, proto.maker, proto.uploc)
+        if cz is None:
+            raise Unsupported("not a closure-maker call")
+        a, b, src = cz
+        w = self.plain_wrap(proto)
+        if w is None:
+            raise Unsupported("closure-maker call without a spec table")
+        child, pairs = w.get(a), w.get(b)
+        if child is None or pairs is None:
+            for kk, what in ((a, "child proto"), (b, "upvalue pairs")):
+                if w.get(kk) is None and w.tid in self.prog.dump.lazy:
+                    path = self.prog.dump.paths().get(w.tid)
+                    if path is not None:
+                        rq = ",".join(str(x) for x in path + [kk])
+                        if self.prog.dump.fetch(rq) is None and rq not in self.prog.requests:
+                            self.prog.requests.add(rq)
+            raise Unsupported("closure-maker call %d/%d not decoded yet" % (a, b))
+        if not isinstance(child, LTable):
+            raise Unsupported("closure-maker call %d/%d holds %s/%s" % (
+                a, b, type(child).__name__, type(pairs).__name__))
+        # the upvalue pairs: a byte string, or an array table of ints
+        pair_at = None
+        if isinstance(pairs, (bytes, bytearray)):
+            pair_at = lambda i: pairs[i - 1]
+            npairs = len(pairs) // 2
+        elif isinstance(pairs, LTable):
+            npairs = pairs.length() // 2
+            if all(isinstance(pairs.get(i), int) for i in range(1, npairs * 2 + 1)):
+                pair_at = lambda i: pairs.get(i)
+        if pair_at is None:
+            raise Unsupported("closure-maker call %d/%d holds %s/%s" % (
+                a, b, type(child).__name__, type(pairs).__name__))
+        # the source table: position -> the local whose slot the child captures
+        srcpos = {}
+        if src is not None:
+            for k, v in _ctor_items(src):
+                srcpos[k] = v
+        # upvalue names, from the pairs
+        child_upnames, child_boxes = {}, {}
+        for i in range(1, npairs + 1):
+            W, t = pair_at(i * 2 - 1), pair_at(i * 2)
+            if t == 0 or src is None:
+                nm = parent_upnames.get(W)
+                if not isinstance(nm, str) or not nm.isidentifier():
+                    raise Unsupported("closure-maker upvalue %d is %r" % (W, nm))
+                child_upnames[i] = nm
+            else:
+                node = srcpos.get(W)
+                if not (isinstance(node, dict) and node.get("type") == "AstExprLocal"):
+                    raise Unsupported("closure-maker box of a non-local (pos %d)" % W)
+                nm = node["local"]["name"]
+                child_upnames[i] = "%s[%d]" % (nm, W)
+                child_boxes[i] = (4, 7)     # the box read X[i][4][X[i][7]] -> the slot
+        # which maker lifts the child: vmobj[child[child[1]]]
+        k1 = child.get(1)
+        mkidx = child.get(k1) if isinstance(k1, int) else None
+        mkval = self._plain_vmobj(proto).get(mkidx) if isinstance(mkidx, int) else None
+        node = getattr(mkval, "node", None)
+        pm = plain_maker(node) if node is not None else None
+        if pm is not None:
+            # a plain child: its maker's inner text with the upvalue names
+            inner2, upi2, wraplocs2 = pm
+            proto2 = PlainProto(inner2, node,
+                                node["args"][upi2]["location"] if upi2 is not None else None,
+                                child, wraplocs2)
+            try:
+                lines2 = plain_closure_lines(self._plain_vm(proto), proto2, child_upnames, child_boxes, self)
+            except Unsupported as ex:
+                return "error(\"devirt: could not lift closure: %s\")" % str(ex).replace("\"", "'")
+            params2 = [x["name"] for x in inner2.get("args", [])] + \
+                (["..."] if inner2.get("vararg") else [])
+        else:
+            # a VM child: lifted by the VM whose maker this is
+            cvm = None
+            for v in self.prog.vms.values():
+                if v.maker is node:
+                    cvm = v
+                    break
+            if cvm is None:
+                raise Unsupported("closure-maker child's VM not found (r[%s] = %r)" % (mkidx, mkval))
+            try:
+                lines2 = self.lift(cvm, self._plain_vmobj_val(proto), child, UpList([]),
+                                   child_upnames, self._plain_depth + 1)
+            except Unsupported as ex:
+                return "error(\"devirt: could not lift closure: %s\")" % str(ex).replace("\"", "'")
+            params2 = self.params
+        self.stats["functions"] += 1
+        body = "\n".join(["function(%s)" % ", ".join(params2)] +
+                         ["\t" + l for l in lines2] + ["end"])
+        return body
+
+    def _plain_vmobj(self, proto):
+        """The VM object a plain closure's maker was called on (for the child
+        maker resolution)."""
+        v = self._plain_vmobj_val(proto)
+        return v if isinstance(v, LTable) else LTable()
+
+    def _plain_vmobj_val(self, proto):
+        if getattr(self, "_cz_vmobj", None) is not None:
+            return self._cz_vmobj
+        mk = proto.maker
+        # the VM object is shared (one setmetatable table): any cap's entry
+        # for the maker's first parameter name
+        nm = mk["args"][0]["name"] if mk.get("args") else None
+        for cap in self.prog.dump.protos.values():
+            v = cap.get(nm) if nm is not None else None
+            if isinstance(v, LTable):
+                return v
+        return None
+
+    def _plain_vm(self, proto):
+        """The VMModel a plain closure belongs to (its maker's)."""
+        mk = proto.maker
+        for v in self.prog.vms.values():
+            if v.maker is mk:
+                return v
+        # any VM of this source (the src_lines are shared)
+        return next(iter(self.prog.vms.values()))
 
 
 def stmt_exprs(st):
@@ -3492,7 +4267,7 @@ def _walk_one(prog, vm, vmobj, proto, pkey):
             if getattr(n, "error", None):
                 print("[walk] %s %s %s" % (pkey.get(proto.tid, proto.tid), s[:2], n.error),
                       file=sys.stderr)
-    kids = [c for c in lf.children if isinstance(c.proto, LTable)]
+    kids = [c for c in lf.children if isinstance(c.proto, LTable) and not isinstance(c.proto, PlainProto)]
     ent["children"] = [pkey.get(c.proto.tid, c.proto) for c in kids]
     ent["child_vms"] = [getattr(getattr(c, "vm", None), "tag", None) for c in kids]
     ent["clean"] = not lf.requests and sum(dump.misses.values()) == nmiss and \

@@ -1,4 +1,5 @@
--- Deobfuscated by ccjvwsod on Discord
+-- Deobfuscated by DevAurora Code
+-- Discord: https://discord.gg/cmYtfCmQU
 -- Detected obfuscation: Luraph v15
 -- Local names are inferred from use (the original names are not in the bytecode)
 

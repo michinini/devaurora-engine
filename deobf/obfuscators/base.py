@@ -55,7 +55,8 @@ class Job:
 
     def credit_header(self):
         """First lines of a result file: the credit and the detected obfuscator."""
-        return ("-- Deobfuscated by ccjvwsod on Discord\n"
+        return ("-- Deobfuscated by DevAurora Code\n"
+                "-- Discord: https://discord.gg/cmYtfCmQU\n"
                 "-- Detected obfuscation: %s\n" % self.obfuscator)
 
     @property
